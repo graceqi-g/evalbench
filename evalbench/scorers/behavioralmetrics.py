@@ -19,6 +19,7 @@ class BehavioralMetrics(comparator.Comparator):
         if not self.model_config:
             raise ValueError("model_config is required for BehavioralMetrics")
         self.model = get_generator(global_models, self.model_config)
+        self.include_tool_calls = config.get("include_tool_calls", False)
 
     def compare(
         self,
@@ -46,13 +47,19 @@ class BehavioralMetrics(comparator.Comparator):
         except json.JSONDecodeError:
             return 0.0, "Invalid JSON in eval result context."
 
-        conversation_history = context.get("conversation_history", "[]")
+        from .util import filter_conversation_history_json
+
+        history_list = context.get("conversation_history", [])
+        formatted_history = filter_conversation_history_json(
+            history_list, include_tool_calls=self.include_tool_calls
+        )
+
         scenario = context.get("scenario", {})
         conversation_plan = scenario.get("conversation_plan", "")
 
         prompt = BEHAVIORAL_METRICS_PROMPT.format(
             conversation_plan=conversation_plan,
-            conversation_history=conversation_history
+            conversation_history=formatted_history
         )
 
         try:
@@ -64,12 +71,12 @@ class BehavioralMetrics(comparator.Comparator):
                 clarifications = 0
 
                 hallucination_match = re.search(
-                    r'Hallucination Count:\s*(\\d+)', response_text)
+                    r'Hallucination Count:\s*(\d+)', response_text)
                 if hallucination_match:
                     hallucinations = int(hallucination_match.group(1))
 
                 clarification_match = re.search(
-                    r'Clarification Count:\s*(\\d+)', response_text)
+                    r'Clarification Count:\s*(\d+)', response_text)
                 if clarification_match:
                     clarifications = int(clarification_match.group(1))
 

@@ -1,4 +1,5 @@
-from .generator import QueryGenerator
+from .agent_cli import AgentCliGenerator
+from .tool_naming import canonicalize_gemini_tool_name
 import subprocess
 import os
 import json
@@ -6,18 +7,20 @@ import logging
 import re
 import shutil
 import sys
+from util.context import rpc_id_var
 
 
 class CLICommand:
-    def __init__(self, cli, prompt, env=None, resume=False, yolo=True):
+    def __init__(self, cli, prompt, env=None, resume=False, yolo=True, cwd=None):
         self.cli = cli
         self.prompt = prompt
         self.env = env if env else {}
         self.resume = resume
         self.yolo = yolo
+        self.cwd = cwd
 
 
-class GeminiCliGenerator(QueryGenerator):
+class GeminiCliGenerator(AgentCliGenerator):
     """Generator queries using Gemini CLI."""
 
     def __init__(self, querygenerator_config):
@@ -28,7 +31,10 @@ class GeminiCliGenerator(QueryGenerator):
 
         # If running via eval_server.py (gRPC), use session-specific path in shared volume
         if sys.argv[0].endswith("eval_server.py"):
-            session_id = querygenerator_config.get("session_id", "default")
+            session_id = querygenerator_config.get("session_id")
+            if not session_id:
+                ctx_id = rpc_id_var.get()
+                session_id = ctx_id if ctx_id != "default" else "default"
             self.fake_home = os.path.join("/tmp_sessions", session_id, "fake_home")
         else:
             self.fake_home = os.path.abspath(os.path.join(".venv", "fake_home"))
@@ -41,32 +47,36 @@ class GeminiCliGenerator(QueryGenerator):
         os.makedirs(self.extensions_dir, exist_ok=True)
         os.makedirs(self.skills_dir, exist_ok=True)
 
-        self.env = querygenerator_config.get("env", {})
+        # Allow-list the fake home directory to enable access to files under it.
+        # This is needed to ensure Gemini CLI can read files within a skill
+        # after resuming the session.
+        gemini_settings_path = os.path.join(self.gemini_home, "settings.json")
+        os.makedirs(os.path.dirname(gemini_settings_path), exist_ok=True)
+
+        current_settings = {}
+        if os.path.exists(gemini_settings_path):
+            try:
+                with open(gemini_settings_path, "r") as f:
+                    current_settings = json.load(f)
+            except json.JSONDecodeError:
+                logging.warning(
+                    "Invalid JSON in Gemini settings at %s; using default settings.",
+                    gemini_settings_path,
+                )
+
+        context_config = current_settings.setdefault("context", {})
+        include_dirs = context_config.setdefault("includeDirectories", [])
+
+        if self.fake_home not in include_dirs:
+            include_dirs.append(self.fake_home)
+
+        with open(gemini_settings_path, "w") as f:
+            json.dump(current_settings, f, indent=2)
+
+        self.env = querygenerator_config.get("env") or {}
         self.env["HOME"] = self.fake_home
 
-        adc_path = self.env.get("GOOGLE_APPLICATION_CREDENTIALS")
-        if not adc_path:
-            adc_path = os.path.join(
-                self.real_home,
-                ".config",
-                "gcloud",
-                "application_default_credentials.json",
-            )
-            if os.path.exists(adc_path):
-                self.env["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
-
-        if adc_path and os.path.exists(adc_path):
-            # Copy the ADC to fake_home
-            fake_gcloud_dir = os.path.join(self.fake_home, ".config", "gcloud")
-            os.makedirs(fake_gcloud_dir, exist_ok=True)
-            fake_adc_path = os.path.join(fake_gcloud_dir, "application_default_credentials.json")
-            if os.path.abspath(adc_path) != os.path.abspath(fake_adc_path):
-                shutil.copy2(adc_path, fake_adc_path)
-
-        if "CLOUDSDK_CONFIG" not in self.env:
-            self.env["CLOUDSDK_CONFIG"] = os.path.join(
-                self.real_home, ".config", "gcloud"
-            )
+        self._setup_gcloud_credentials(self.env, self.real_home, self.fake_home)
 
         self.gemini_cli_version = querygenerator_config.get(
             "gemini_cli_version", "gemini-cli"
@@ -780,10 +790,10 @@ class GeminiCliGenerator(QueryGenerator):
         return self._run_gemini_cli(cli_cmd)
 
     def _execute_cli_command(
-        self, command: list[str], env: dict[str, str] | None = None
+        self, command: list[str], env: dict[str, str] | None = None, cwd: str | None = None
     ) -> subprocess.CompletedProcess:
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
+            result = subprocess.run(command, capture_output=True, text=True, check=False, env=env, cwd=cwd if cwd else self.fake_home)
             # Filter out benign schema warnings from json decoder from stderr to reduce noise
             if result.stderr:
                 result.stderr = "\n".join(
@@ -837,7 +847,7 @@ class GeminiCliGenerator(QueryGenerator):
             ]
         )
 
-        result = self._execute_cli_command(command, env=env)
+        result = self._execute_cli_command(command, env=env, cwd=cli_cmd.cwd)
         if result.returncode == 0 and result.stdout:
             result.stdout = self._parse_stream_json(result.stdout)
 
@@ -846,9 +856,10 @@ class GeminiCliGenerator(QueryGenerator):
     def _parse_stream_json(self, stream_output: str) -> str:
         import dateutil.parser
 
-        final_obj = {"session_id": "", "response": "", "stats": {}}
-        tool_uses = {}
-        tool_results = {}
+        from collections import OrderedDict
+
+        final_obj = {"session_id": "", "response": "", "stats": {}, "tool_calls": []}
+        tool_calls_dict = OrderedDict()
         model_name = "gemini-2.5-flash"
 
         for line in stream_output.split("\n"):
@@ -866,11 +877,28 @@ class GeminiCliGenerator(QueryGenerator):
                 elif t == "tool_use":
                     tool_id = event.get("tool_id")
                     if tool_id:
-                        tool_uses[tool_id] = event
+                        tname = canonicalize_gemini_tool_name(
+                            event.get("tool_name", "unknown")
+                        )
+                        tool_calls_dict[tool_id] = {
+                            "tool_id": tool_id,
+                            "tool_name": tname,
+                            "parameters": event.get("parameters", {}),
+                            "status": None,
+                            "response": None,
+                            "timestamp": event.get("timestamp"),
+                        }
                 elif t == "tool_result":
                     tool_id = event.get("tool_id")
-                    if tool_id:
-                        tool_results[tool_id] = event
+                    if tool_id and tool_id in tool_calls_dict:
+                        tool_calls_dict[tool_id]["status"] = event.get("status")
+                        tool_calls_dict[tool_id]["result_timestamp"] = event.get("timestamp")
+                        res = event.get("result")
+                        if res is None:
+                            res = event.get("content")
+                        if res is None:
+                            res = event.get("output")
+                        tool_calls_dict[tool_id]["response"] = res
                 elif t == "result":
                     s = event.get("stats", {})
                     total_duration = s.get("duration_ms", 0)
@@ -912,29 +940,36 @@ class GeminiCliGenerator(QueryGenerator):
                     final_obj["stats"]["models"] = models
 
                     tools_stats = {
-                        "totalCalls": len(tool_uses),
+                        "totalCalls": len(tool_calls_dict),
                         "totalSuccess": sum(
                             1
-                            for tr in tool_results.values()
-                            if tr.get("status") == "success"
+                            for tc in tool_calls_dict.values()
+                            if tc.get("status") == "success"
                         ),
                         "totalFail": sum(
                             1
-                            for tr in tool_results.values()
-                            if tr.get("status") != "success"
+                            for tc in tool_calls_dict.values()
+                            if tc.get("status") != "success"
                         ),
                         "totalDurationMs": 0,
                         "decisions": {
-                            "accept": len(tool_uses),
+                            "accept": len(tool_calls_dict),
                             "reject": 0,
                             "modify": 0,
-                            "auto_accept": len(tool_uses),
+                            "auto_accept": len(tool_calls_dict),
                         },
                         "byName": {},
                     }
 
-                    for tid, tu in tool_uses.items():
-                        tname = tu.get("tool_name", "unknown")
+                    for tc in tool_calls_dict.values():
+                        # Gemini CLI reports MCP tools as
+                        # ``mcp_<server>_<tool>`` (single-underscore
+                        # separators); native tools use their bare names.
+                        # Normalize MCP tools to the canonical
+                        # ``<server>__<tool>`` form so the trajectory
+                        # matcher can compare across harnesses without
+                        # per-generator logic.
+                        tname = tc.get("tool_name", "unknown")
                         if tname not in tools_stats["byName"]:
                             tools_stats["byName"][tname] = {
                                 "count": 0,
@@ -952,27 +987,27 @@ class GeminiCliGenerator(QueryGenerator):
 
                         tstat = tools_stats["byName"][tname]
                         tstat["count"] += 1
-                        tstat["parameters"].append(tu.get("parameters", {}))
+                        tstat["parameters"].append(tc.get("parameters", {}))
                         tstat["decisions"]["accept"] += 1
                         tstat["decisions"]["auto_accept"] += 1
 
-                        tr = tool_results.get(tid)
                         duration = 0
-                        if tr:
-                            if tr.get("status") == "success":
+                        status = tc.get("status")
+                        if status is not None:
+                            if status == "success":
                                 tstat["success"] += 1
                             else:
                                 tstat["fail"] += 1
 
                             try:
-                                t1 = dateutil.parser.isoparse(tu["timestamp"])
-                                t2 = dateutil.parser.isoparse(tr["timestamp"])
+                                t1 = dateutil.parser.isoparse(tc["timestamp"])
+                                t2 = dateutil.parser.isoparse(tc["result_timestamp"])
                                 duration = int((t2 - t1).total_seconds() * 1000)
                             except Exception as e:
                                 logging.debug(
                                     "Failed to parse tool timestamps for duration calculation: "
-                                    f"tool_use_ts={tu.get('timestamp')!r}, "
-                                    f"tool_result_ts={tr.get('timestamp')!r}, error={e}"
+                                    f"tool_use_ts={tc.get('timestamp')!r}, "
+                                    f"tool_result_ts={tc.get('result_timestamp')!r}, error={e}"
                                 )
 
                         tstat["durationMs"] += duration
@@ -982,7 +1017,12 @@ class GeminiCliGenerator(QueryGenerator):
             except Exception as e:
                 logging.debug(f"Failed to parse stream JSON line: {e}")
 
+        final_obj["tool_calls"] = list(tool_calls_dict.values())
         return json.dumps(final_obj, indent=2)
+
+    @property
+    def version(self) -> str:
+        return self.gemini_cli_version
 
     def parse_response(self, stdout: str) -> dict:
         if not stdout:
@@ -994,7 +1034,14 @@ class GeminiCliGenerator(QueryGenerator):
             return {}
 
     def extract_tools(self, stdout: str) -> list[str]:
-        """Extracts the list of tools used from the CLI output."""
+        """Extracts the list of tools used from the CLI output.
+
+        Returns every tool the harness recorded -- MCP calls in canonical
+        ``<server>__<tool>`` form alongside native Gemini tools
+        (``update_topic``, ``run_shell_command``, ``write_file``, ...).
+        The trajectory scorer is responsible for filtering native tools
+        when ``filter_native_tools`` is enabled.
+        """
         output_json = self.parse_response(stdout)
         if (
             "stats" in output_json
@@ -1003,6 +1050,27 @@ class GeminiCliGenerator(QueryGenerator):
         ):
             return list(output_json["stats"]["tools"]["byName"].keys())
         return []
+
+    def extract_skills(self, stdout: str) -> list[str]:
+        """Extracts activated skill names from the activate_skill tool's parameters.
+
+        In Gemini CLI, skills are invoked via the 'activate_skill' built-in tool.
+        This method extracts skill names from the parameters of activate_skill calls.
+        """
+        output_json = self.parse_response(stdout)
+        try:
+            by_name = output_json["stats"]["tools"]["byName"]
+            activate_calls = by_name.get("activate_skill", {})
+            parameters_list = activate_calls.get("parameters", [])
+            skills = []
+            for params in parameters_list:
+                # Try common parameter names for skill name
+                skill_name = params.get("skill_name") or params.get("skillName") or params.get("skill") or params.get("name")
+                if skill_name and skill_name not in skills:
+                    skills.append(skill_name)
+            return skills
+        except (KeyError, TypeError):
+            return []
 
     def safe_generate(self, cli_cmd: CLICommand) -> subprocess.CompletedProcess:
         result = self.generate_internal(cli_cmd)
@@ -1014,7 +1082,8 @@ class GeminiCliGenerator(QueryGenerator):
         return result
 
     def create_command(
-        self, cli: str, prompt: str, env: dict = None, resume: bool = False
+        self, cli: str, prompt: str, env: dict = None, resume: bool = False,
+        session_id: str = None, cwd: str = None,
     ) -> CLICommand:
         merged_env = self.env.copy()
 
@@ -1025,4 +1094,4 @@ class GeminiCliGenerator(QueryGenerator):
 
         if env:
             merged_env.update(env)
-        return CLICommand(cli=cli, prompt=prompt, env=merged_env, resume=resume)
+        return CLICommand(cli=cli, prompt=prompt, env=merged_env, resume=resume, cwd=cwd)

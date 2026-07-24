@@ -52,7 +52,7 @@ graph TD
 ### Core Components
 - **Orchestrators**: Manages dataset breakdown and parallel execution stages (`OneShotOrchestrator`, `InteractOrchestrator`, `AgentOrchestrator`, `DataAgentOrchestrator`).
 - **Evaluators**: Executes the test scenario lifecycles for a given dialect or database (`Evaluator`, `InteractEvaluator`, `AgentEvaluator`, `DataAgentEvaluator`).
-- **Generators**: Acts as the driver for the tested model or CLI (`GeminiCliGenerator`, `ClaudeCodeGenerator`, `QueryData`).
+- **Generators**: Acts as the driver for the tested model or CLI (`GeminiCliGenerator`, `ClaudeCodeGenerator`, `CodexCliGenerator`, `AgyCliGenerator`, `QueryData`).
 - **Simulated Users**: Drives conversations autonomously by translating conversation plans into user messages.
 - **Scorers**: Computes correctness metrics (Exact Match, LLM-Rater, Trajectory Matcher, Behavioral Metrics).
 
@@ -81,7 +81,9 @@ evalbench/
 ├── generators/       # Tested system adapters
 │   ├── models/
 │   │   ├── claude_code.py  # Claude Code driver
-│   │   └── gemini_cli.py   # Gemini CLI driver
+│   │   ├── codex_cli.py    # Codex CLI driver
+│   │   ├── gemini_cli.py   # Gemini CLI driver
+│   │   └── agy_cli.py      # Antigravity (agy) CLI driver
 │   └── prompts/
 ├── mp/               # Multi-processing / multi-threading runners
 │   └── mprunner.py
@@ -105,9 +107,9 @@ When evaluating agentic frameworks that leverage external tools (e.g., Gemini CL
 
 | Paradigm | Supported Generators | How it Works |
 |---|---|---|
-| **MCP Servers** | `gemini_cli`, `claude_code` | Remote HTTP/SSE or local stdio-based Model Context Protocol servers |
-| **Extensions** | `gemini_cli` | GitHub-hosted plugin packages installed idempotently via CLI |
-| **Skills** | `gemini_cli` | Local or registry skill packages enabled/linked in the sandboxed environment |
+| **MCP Servers** | `gemini_cli`, `claude_code`, `codex_cli`, `agy_cli` | Remote HTTP/SSE or local stdio-based Model Context Protocol servers |
+| **Extensions** | `gemini_cli`, `claude_code`, `codex_cli` | GitHub-hosted plugin packages installed idempotently via CLI |
+| **Skills** | `gemini_cli`, `claude_code`, `codex_cli`, `agy_cli` | Skill packages installed into the sandboxed environment via each CLI's native mechanism (e.g. link/enable for gemini, `agy plugin install` for agy) |
 
 ---
 
@@ -207,7 +209,7 @@ Contains the test cases.
       "id": "list-instances-01",
       "starting_prompt": "List all Cloud SQL instances in project my-evaluation-project",
       "conversation_plan": "Ensure the agent accurately calls list_instances. Verify the output is returned correctly.",
-      "expected_trajectory": ["list_instances"],
+      "expected_trajectory": ["cloud-sql__list_instances"],
       "env": { "GOOGLE_CLOUD_PROJECT": "my-evaluation-project" },
       "max_turns": 4
     }
@@ -222,6 +224,7 @@ To upload metrics directly to Google BigQuery and create Looker Studio dashboard
 reporting:
   bigquery:
     gcp_project_id: 'your-gcp-project-id'
+    dataset_name: 'evalbench' # Optional, defaults to 'evalbench'
     dataset_location: 'US' # Optional, defaults to 'US'
 ```
 
@@ -231,10 +234,12 @@ reporting:
 
 ### Setup Python Virtual Environment
 
+Using `uv` to manage the environment:
+
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+uv venv
+source .venv/bin/activate
+uv sync
 ```
 
 ### GCP Authentication
@@ -271,6 +276,7 @@ If settings from a previous run conflict or cause issues, clear out the generato
 ```bash
 rm -rf .venv/fake_home
 rm -rf .venv/fake_home_claude
+rm -rf .venv/fake_home_agy
 ```
 
 ### Forcing Sequential Runs

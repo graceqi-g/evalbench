@@ -1,0 +1,44 @@
+############################################################
+### Dataset / Eval Items
+############################################################
+dataset_config: datasets/codex-cli-tools/codex-cli.evalset.json
+dataset_format: agent-format
+
+orchestrator: agent
+model_config: datasets/model_configs/codex_cli_model.yaml
+simulated_user_model_config: datasets/model_configs/gemini_2.5_pro_model.yaml
+
+# Concurrency: number of scenarios to run in parallel.
+# Set to 1 for sequential runs (easier to follow logs, avoids session conflicts
+# on the shared sandboxed ~/.codex store).
+runners:
+  agent_runners: 1
+
+############################################################
+### Scorer Related Configs
+############################################################
+scorers:
+  # By default trajectory_matcher drops native/harness-internal tools
+  # (shell, file ops, ...) from both expected and actual trajectories
+  # before scoring. Uncomment the block below to keep them and score
+  # native-tool usage too.
+  trajectory_matcher: {}
+  # trajectory_matcher:
+  #   filter_native_tools: false
+  goal_completion:
+    model_config: datasets/model_configs/gemini_2.5_pro_model.yaml
+  behavioral_metrics:
+    model_config: datasets/model_configs/gemini_2.5_pro_model.yaml
+  parameter_analysis:
+    model_config: datasets/model_configs/gemini_2.5_pro_model.yaml
+  turn_count: {}
+  end_to_end_latency: {}
+  tool_call_latency: {}
+  token_consumption: {}
+
+############################################################
+### Reporting Related Configs
+############################################################
+reporting:
+  csv:
+    output_directory: 'results'

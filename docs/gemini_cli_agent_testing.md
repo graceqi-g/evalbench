@@ -89,10 +89,10 @@ EvalBench's Gemini CLI integration enables automated, multi-turn evaluation of a
 
 ## Prerequisites
 
-1. **Python 3.10+** and project dependencies installed:
+1. **Python 3.10+** and project dependencies installed using `uv`:
    ```bash
    cd evalbench
-   pip install -r requirements.txt
+   uv sync
    ```
 
 2. **Node.js and npm** (for Gemini CLI execution)
@@ -249,10 +249,16 @@ The evalset JSON file defines the test scenarios. Each scenario represents an ag
 | `id` | Yes | Unique identifier for the scenario |
 | `starting_prompt` | Yes | The first user message sent to Gemini CLI |
 | `conversation_plan` | Yes | Natural language instructions that guide the simulated user's behavior across turns. This defines the goals, expected information to provide, and how to react to agent responses. |
-| `expected_trajectory` | Yes | Ordered list of tool names the agent is expected to call. Used by `trajectory_matcher` scorer. |
+| `expected_trajectory` | Yes | Ordered list of tool names the agent is expected to call. Used by `trajectory_matcher` scorer. See [Tool name format](#tool-name-format) below. |
 | `env` | Optional | Per-scenario environment variables (merged with model config env) |
 | `kind` | Optional | Category label (e.g., `"tools"`) |
 | `max_turns` | Yes | Maximum number of conversation turns before the evaluation stops |
+
+#### Tool name format
+
+Entries in `expected_trajectory` use the canonical form `<server>__<tool>` (double-underscore separator) for MCP tools, and the bare name for native harness tools (e.g. `Read`, `Bash`, `run_shell_command`). Each harness adapter normalizes its raw tool-call event into this form at the boundary, so the same evalset can score runs from Codex, Claude Code, and Gemini CLI without modification. The `<server>` segment comes from the MCP server key in your model config and is case-sensitive — e.g. `cloud-sql` or `bigtable`. See `evalbench/generators/models/tool_naming.py` for the canonicalization helper.
+
+By default the `trajectory_matcher` scorer drops native/harness-internal tools (anything that is **not** in canonical `<server>__<tool>` form) from both the expected and actual lists before scoring, so authors can keep `expected_trajectory` focused on user-visible MCP intent without the score being dragged down by harness-internal calls like `update_topic` or `Bash`. Set `filter_native_tools: false` on the scorer if you intentionally want to score native-tool usage — see the [scorer configuration example](#scorer-configuration-example).
 
 #### Writing Good Conversation Plans
 
@@ -270,7 +276,7 @@ The `conversation_plan` is a critical part of each scenario. It instructs the si
   "id": "csql-create-ambiguous-multiturn-01",
   "starting_prompt": "I need a database.",
   "conversation_plan": "The user starts with a vague request. You want to CREATE a NEW Cloud SQL instance named 'my-pg-app'. If the agent offers to create one, say YES. When asked for details, provide 'my-pg-app' as the instance name and 'user_data' as the database name. Never claim to have an existing instance. The goal is for the agent to eventually create the database 'user_data' inside 'my-pg-app' in astana-evaluation project.",
-  "expected_trajectory": ["list_instances", "create_instance", "create_database"],
+  "expected_trajectory": ["cloud-sql__list_instances", "cloud-sql__create_instance", "cloud-sql__create_database"],
   "env": {
     "GOOGLE_CLOUD_PROJECT": "astana-evaluation"
   },
@@ -612,7 +618,7 @@ These require no additional model:
 
 | Scorer | Score Range | Description |
 |--------|------------|-------------|
-| `trajectory_matcher` | 0–100 | Compares expected vs. actual tool usage. Uses **Jaccard Similarity** by default (set-based, order-insensitive). Set `enforce_order: true` for **Levenshtein distance** (order-sensitive). |
+| `trajectory_matcher` | 0–100 | Compares expected vs. actual tool usage. Uses **Jaccard Similarity** by default (set-based, order-insensitive). Set `enforce_order: true` for **Levenshtein distance** (order-sensitive). Native/harness-internal tools are dropped from both sides before scoring by default; set `filter_native_tools: false` to keep them. See [Tool name format](#tool-name-format) for the canonical-name rule the filter uses. |
 | `turn_count` | Count | Reports the number of conversation turns the agent took. Lower is generally better. |
 | `end_to_end_latency` | Milliseconds | Total latency = model API latency + tool execution latency. |
 | `tool_call_latency` | Milliseconds | Sum of all tool execution durations across all turns. |
@@ -624,9 +630,13 @@ These require no additional model:
 ```yaml
 scorers:
   # Deterministic scorers (no model needed)
+  # trajectory_matcher drops native/harness-internal tools (Read, Bash,
+  # run_shell_command, ...) by default — uncomment the expanded block
+  # below to opt out, or to enforce ordered matching.
   trajectory_matcher: {}
   # trajectory_matcher:
-  #   enforce_order: true  # Use Levenshtein for ordered matching
+  #   filter_native_tools: false  # keep native tools in the score
+  #   enforce_order: true         # use Levenshtein for ordered matching
   turn_count: {}
   end_to_end_latency: {}
   tool_call_latency: {}
@@ -790,7 +800,7 @@ reporting:
          "id": "list-and-inspect-01",
          "starting_prompt": "list all instances in project my-project",
          "conversation_plan": "Ask the agent to list instances. Once listed, get details of the 'prod-db' instance and verify it is RUNNABLE.",
-         "expected_trajectory": ["list_instances", "get_instance"],
+         "expected_trajectory": ["cloud-sql__list_instances", "cloud-sql__get_instance"],
          "env": { "GOOGLE_CLOUD_PROJECT": "my-project" },
          "kind": "tools",
          "max_turns": 3
@@ -866,7 +876,7 @@ reporting:
          "id": "fake-create-success",
          "starting_prompt": "Create a new Cloud SQL instance named 'test-db' in project 'my-project'.",
          "conversation_plan": "All details are in the prompt. The agent should call create_instance and report success.",
-         "expected_trajectory": ["create_instance"],
+         "expected_trajectory": ["cloud-sql__create_instance"],
          "env": { "GOOGLE_CLOUD_PROJECT": "my-project" },
          "kind": "tools",
          "max_turns": 3

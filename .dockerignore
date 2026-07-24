@@ -2,4 +2,7 @@
 .git
 __pycache__
 *.pyc
+.pytest_cache
 results
+.jetskicli
+

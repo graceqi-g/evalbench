@@ -1,0 +1,52 @@
+############################################################
+### MCP Readability — sample run config
+############################################################
+# Drives the `mcp_readability` orchestrator: for each endpoint, fetch its tools
+# (rendered as a man-page), score them against the style guide with an LLM, and
+# emit one result row per endpoint to the shared EvalBench reporters.
+#
+# NOTE: this is a sample/illustrative config. The `mcp_tools` generator (this PR)
+# already consumes `endpoints.yaml` and each entry's `tools_source`. The
+# `mcp_readability` orchestrator and the LLM judge referenced below land in a
+# follow-up PR.
+
+orchestrator: mcp_readability
+
+# Plug-and-play scorers. Each key names a registered mcp_readability scorer
+# (SCORER_REGISTRY in the orchestrator) and carries that scorer's own config.
+# The orchestrator runs every scorer declared here against each endpoint and
+# merges their result columns; the shared analyzer aggregates a per-scorer pass
+# rate (comparator = scorer name) for the scores / summary reports. Add a scorer
+# (e.g. conformance) by registering the class and adding a block here.
+scorers:
+  # Deterministic size metrics. Pass = within token budget. `token_budget` feeds
+  # mcp_readability_token_budget_used_percent (endpoints may override per-entry).
+  mcp_tool_metrics:
+    token_budget: 200000
+  # LLM judge vs the style guide. Pass = no P0 findings. Owns its model config
+  # and style-guide path. Run with EVAL_GCP_PROJECT_REGION=global.
+  mcp_style_readability:
+    model_config: datasets/model_configs/gemini_3.1_pro_model.yaml
+    style_guide: datasets/mcp_readability/style_guide.md
+
+# Inputs (paths relative to the repo root / run cwd).
+endpoints_config: datasets/mcp_readability/endpoints.yaml
+exceptions_config: datasets/mcp_readability/exceptions.yaml          # optional
+tools_generator_config: datasets/mcp_readability/tools_generator.yaml
+
+# Optional filter: only check endpoints whose endpoint_type is in this list.
+# Empty = check all. e.g. [PROD]
+endpoint_types: []
+
+# Per-endpoint check concurrency.
+runners:
+  endpoint_runners: 4
+
+# Shared EvalBench reporters. CSV writes results/<job_id>/evals.csv; uncomment
+# bigquery to also append rows to <gcp_project_id>.evalbench.results
+# (schema auto-evolves).
+reporting:
+  csv:
+    output_directory: 'results'
+  # bigquery:
+  #   gcp_project_id: your-gcp-project

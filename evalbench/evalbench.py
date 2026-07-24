@@ -1,22 +1,23 @@
 """EvalBench is a framework to measure the quality of a generative AI (GenAI) workflow."""
 
 from collections.abc import Sequence
-from absl import app
-from absl import flags
-from reporting import get_reporters
-from util.config import load_yaml_config, config_to_df
-from dataset.dataset import load_json, load_dataset_from_json, flatten_dataset
-from evaluator import get_orchestrator
-import reporting.report as report
-import reporting.analyzer as analyzer
 import logging
-from util.config import set_session_configs
-from util.service import load_session_configs
-from util.flags import EXPERIMENT_CONFIG
+import multiprocessing
 import os
 import sys
+from absl import app
+from absl import flags
+from dataset.dataset import flatten_dataset, load_dataset_from_json, load_json
+from evaluator import get_orchestrator
+from reporting import get_reporters
+import reporting.analyzer as analyzer
+import reporting.report as report
+from util.config import config_to_df, load_yaml_config
+from util.config import set_session_configs
+from util.flags import EXPERIMENT_CONFIG
+from util.scriptrunner import run_script
+from util.service import load_session_configs
 import yaml
-import multiprocessing
 
 try:
     import google.colab  # type: ignore
@@ -28,14 +29,27 @@ except ImportError:
 logging.getLogger().setLevel(logging.INFO)
 
 
+_SCENARIOS = flags.DEFINE_list(
+    "scenarios",
+    [],
+    "List of scenario IDs to run. Defaults to empty (runs all scenarios).",
+)
+_SCENARIO_PATTERN = flags.DEFINE_string(
+    "scenario_pattern",
+    None,
+    "Glob pattern of scenario IDs to run. Defaults to None (runs all scenarios).",
+)
 _SUITE_CONFIG = flags.DEFINE_string(
     "suite_config",
     None,
     "Path to a suite configuration file to run multiple experiments.",
 )
+flags.declare_key_flag('experiment_config')
 
 
 def eval(experiment_config: str):
+    config = None
+    session_dir = None
     try:
         logging.info("EvalBench v1.0.0")
         logging.getLogger("google_genai.models").setLevel(logging.WARNING)
@@ -44,14 +58,36 @@ def eval(experiment_config: str):
         session: dict = {}
 
         parsed_config = load_yaml_config(experiment_config)
+
+        # Helper logic to generate clean display path
+        display_config = experiment_config
+        g3_idx = display_config.find("google3/")
+        if g3_idx != -1:
+            display_config = display_config[g3_idx:]
+
         if parsed_config == "":
-            logging.error("No Eval Config Found.")
+            logging.error(f"No Eval Config Found for '{display_config}'.")
             return
+
+        # 1. Merge Environment Variables (overrides YAML)
+        env_scenarios = os.environ.get("EVAL_SCENARIOS")
+        if env_scenarios:
+            parsed_config["scenarios"] = [s.strip() for s in env_scenarios.split(",") if s.strip()]
+
+        env_pattern = os.environ.get("EVAL_SCENARIO_PATTERN")
+        if env_pattern:
+            parsed_config["scenario_pattern"] = env_pattern
+
+        # 2. Merge CLI Flags (overrides Environment Variables and YAML)
+        if flags.FLAGS.is_parsed():
+            if _SCENARIOS.value:
+                parsed_config["scenarios"] = _SCENARIOS.value
+            if _SCENARIO_PATTERN.value:
+                parsed_config["scenario_pattern"] = _SCENARIO_PATTERN.value
 
         set_session_configs(session, parsed_config)
         # Load the configs
-        config, db_configs, model_config, setup_config = load_session_configs(
-            session)
+        config, db_configs, model_config, setup_config = load_session_configs(session)
         logging.info("Loaded Configurations in %s", experiment_config)
 
         # Load the dataset
@@ -61,27 +97,56 @@ def eval(experiment_config: str):
             config, db_configs, setup_config, report_progress=True
         )
 
+        # Resolve session directory for local standalone logs
+        reporting_config = config.get("reporting") or {}
+        csv_config = reporting_config.get("csv") or {}
+        base_output_dir = csv_config.get("output_directory", "results")
+        session_dir = os.path.abspath(os.path.join(base_output_dir, evaluator.job_id))
+
+        set_up_script = config.get("set_up_script")
+        if set_up_script:
+            if os.path.exists(set_up_script):
+                logging.info("Executing set_up_script '%s'", set_up_script)
+                run_script(
+                    set_up_script,
+                    session_dir,
+                    "setup",
+                    env_updates=config.get("env")
+                )
+            else:
+                logging.error(
+                    "Cannot run set_up_script, file not found at '%s'", set_up_script
+                )
+
         # Run evaluations
         evaluator.evaluate(flatten_dataset(dataset))
-        job_id, run_time, results_tf, scores_tf = evaluator.process()
+        job_id, run_time, results_tf, scores_tf, multi_trial_scores_tf = (
+            evaluator.process()
+        )
 
         # Create Dataframes for reporting
         if results_tf is not None and scores_tf is not None:
-            reporters = get_reporters(
-                parsed_config.get("reporting"), job_id, run_time)
-            config_df = config_to_df(
-                job_id, run_time, config, model_config, db_configs)
+            reporters = get_reporters(parsed_config.get("reporting"), job_id, run_time)
+            config_df = config_to_df(job_id, run_time, config, model_config, db_configs)
             results = load_json(results_tf)
             results_df = report.get_dataframe(results)
             report.quick_summary(results_df)
             scores = load_json(scores_tf)
+            if multi_trial_scores_tf:
+                multi_trial_scores = load_json(multi_trial_scores_tf)
+                if multi_trial_scores:
+                    scores.extend(multi_trial_scores)
+
+            num_prompts = len(flatten_dataset(dataset))
+            num_trials = config.get("num_trials", 1)
             scores_df, summary_scores_df = analyzer.analyze_result(
-                scores, config)
+                scores, config, num_prompts=num_prompts, num_trials=num_trials
+            )
             summary_scores_df["job_id"] = job_id
             summary_scores_df["run_time"] = run_time
         else:
             logging.warning(
-                "There were no matching evals in this run. Returning empty set."
+                f"There were no matching evals in run for config '{display_config}'. Returning empty set."
             )
             reporters = []
             config_df = None
@@ -98,14 +163,31 @@ def eval(experiment_config: str):
             reporter.print_dashboard_links()
 
         print(f"Finished Job ID {job_id}")
+
         return True
     except Exception as e:
-        logging.exception(e)
+        display_config = experiment_config
+        g3_idx = display_config.find("google3/")
+        if g3_idx != -1:
+            display_config = display_config[g3_idx:]
+        logging.exception(f"Evaluation failed for config '{display_config}': {e}")
         return False
+    finally:
+        if config and session_dir:
+            tear_down_script = config.get("tear_down_script")
+            if tear_down_script:
+                if os.path.exists(tear_down_script):
+                    logging.info("Executing tear_down_script '%s'", tear_down_script)
+                    run_script(tear_down_script, session_dir, "teardown")
+                else:
+                    logging.error(
+                        "Cannot run tear_down_script, file not found at '%s'",
+                        tear_down_script,
+                    )
 
 
 def run_suite(suite_config_path: str) -> bool:
-    with open(suite_config_path, 'r') as f:
+    with open(suite_config_path, "r") as f:
         suite_conf = yaml.safe_load(f)
 
     runs = suite_conf.get("runs", [])
@@ -113,8 +195,7 @@ def run_suite(suite_config_path: str) -> bool:
         logging.error("No runs defined in suite config.")
         return False
 
-    logging.info(
-        f"Starting EvalBench Suite: {suite_conf.get('name', 'Unnamed Suite')}")
+    logging.info(f"Starting EvalBench Suite: {suite_conf.get('name', 'Unnamed Suite')}")
     logging.info(f"Total runs scheduled: {len(runs)}")
 
     results = []
@@ -123,13 +204,14 @@ def run_suite(suite_config_path: str) -> bool:
         config_path = run.get("config_path")
 
         if not config_path:
-            logging.error(
-                f"Run '{run_name}' is missing 'config_path'. Skipping.")
+            logging.error(f"Run '{run_name}' is missing 'config_path'. Skipping.")
             results.append((run_name, False))
             continue
 
         logging.info(
-            f"\n{'=' * 50}\nExecuting Suite Run {i + 1}/{len(runs)}: {run_name}\nConfig: {config_path}\n{'=' * 50}")
+            f"\n{'=' * 50}\nExecuting Suite Run {i + 1}/{len(runs)}:"
+            f" {run_name}\nConfig: {config_path}\n{'=' * 50}"
+        )
 
         success = eval(config_path)
         results.append((run_name, success))
@@ -159,6 +241,24 @@ def main(argv: Sequence[str]):
     return os._exit(exit_code)
 
 
+def run():
+    """Starting function for the uvx package entrypoint."""
+    # Fix absl help output when run via uvx/launcher
+    if '__main__' in sys.modules:
+        main_module = sys.modules['__main__']
+        if main_module.__doc__ and 'exec' in main_module.__doc__:
+            main_module.__doc__ = sys.modules[__name__].__doc__
+            # Clean up sys.argv[0] to hide the full temporary path
+            sys.argv[0] = os.path.basename(sys.argv[0])
+            # Register key flags for __main__ and sys.argv[0] so they show up in launcher's short help
+            flags.FLAGS.register_key_flag_for_module('__main__', flags.FLAGS['experiment_config'])
+            flags.FLAGS.register_key_flag_for_module('__main__', flags.FLAGS['suite_config'])
+            flags.FLAGS.register_key_flag_for_module(sys.argv[0], flags.FLAGS['experiment_config'])
+            flags.FLAGS.register_key_flag_for_module(sys.argv[0], flags.FLAGS['suite_config'])
+    app.run(main)
+
+
 if __name__ == "__main__":
-    multiprocessing.freeze_support()  # Required for PyInstaller multiprocessing support
+    # Required for PyInstaller multiprocessing support
+    multiprocessing.freeze_support()
     app.run(main)

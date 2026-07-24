@@ -3,12 +3,38 @@
 from typing import Any, Optional
 import json
 import logging
+import fnmatch
 from collections.abc import Sequence
 from dataset.evalinput import EvalInputRequest
 from dataset.evalinteractinput import EvalInteractInputRequest
 from dataset.evalgeminicliinput import EvalGeminiCliRequest
+from dataset.cortadoinput import EvalCortadoRequest
+from dataset.dataengineeringagentinput import EvalDeaRequest
 from itertools import chain
 import os
+import re
+
+
+_ENV_PLACEHOLDER_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _expand_env_placeholders(text: str, source_path: str) -> str:
+    """Substitutes ``${VAR}`` placeholders in a raw dataset from the
+    environment, so values like a GCP project are supplied at runtime instead
+    of hard-coded. Fails fast on any unresolved placeholder rather than
+    passing a literal ``${VAR}`` to the agent.
+    """
+    expanded = os.path.expandvars(text)
+    unresolved = sorted(
+        {m.group(1) for m in _ENV_PLACEHOLDER_RE.finditer(expanded)}
+    )
+    if unresolved:
+        raise ValueError(
+            f"Unresolved ${{...}} placeholder(s) in dataset {source_path}: "
+            f"{unresolved}. Export the corresponding environment variable(s) "
+            f"before running (e.g. `export {unresolved[0]}=...`)."
+        )
+    return expanded
 
 
 def load_schema(dataset_dir: str, selected_database: str):
@@ -35,8 +61,8 @@ def load_knowledge(
                 if not line.strip():
                     continue
                 obj = json.loads(line)
-            if obj.get("id") not in exclude_ids:
-                external_kg_list.append(json.dumps(obj))
+                if obj.get("id") not in exclude_ids:
+                    external_kg_list.append(json.dumps(obj))
 
     external_kg = "\n".join(external_kg_list)
     return external_kg
@@ -95,16 +121,114 @@ def load_bird_interact_dataset(json_file_path, config):
     return input_items
 
 
-def load_gemini_cli_json(json_file_path):
+def load_dea_json(json_file_path, config):
+    all_items: dict[str, list[EvalDeaRequest]] = {
+        "dea-format": [],
+    }
+    with open(json_file_path, "r") as json_file:
+        content = json_file.read()
+        data = json.loads(content)
+
+        # Filter scenarios
+        scenarios = data.get("scenarios", [])
+        filtered_scenarios = _filter_scenarios(scenarios, config)
+        if scenarios and not filtered_scenarios:
+            return all_items
+
+        if "scenarios" in data:
+            data["scenarios"] = filtered_scenarios
+
+        eval_input = EvalDeaRequest(
+            raw_dict=data
+        )
+        all_items["dea-format"].append(eval_input)
+
+    return all_items
+
+
+def _filter_scenarios(scenarios: list[dict], config: dict) -> list[dict]:
+    """Filters a list of scenarios based on explicit IDs or glob pattern in config."""
+    scenarios_to_run = config.get("scenarios", [])
+    if isinstance(scenarios_to_run, str):
+        scenarios_to_run = [s.strip() for s in scenarios_to_run.split(",") if s.strip()]
+
+    scenario_pattern = config.get("scenario_pattern", None)
+
+    # If no filters are specified, return the original list (run all)
+    if not scenarios_to_run and not scenario_pattern:
+        return scenarios
+
+    filtered_scenarios = []
+    for scenario in scenarios:
+        scenario_id = scenario.get("id")
+        if not scenario_id:
+            continue
+
+        # Match explicit list of IDs
+        if scenarios_to_run and scenario_id not in scenarios_to_run:
+            continue
+
+        # Match glob pattern
+        if scenario_pattern:
+            if not fnmatch.fnmatch(scenario_id, scenario_pattern):
+                continue
+
+        filtered_scenarios.append(scenario)
+
+    return filtered_scenarios
+
+
+def load_cortado_json(json_file_path, config):
+    all_items: dict[str, list[EvalCortadoRequest]] = {
+        "cortado-format": [],
+    }
+    with open(json_file_path, "r") as json_file:
+        data = json.load(json_file)
+
+        scenarios = data.get("scenarios", [])
+        filtered_scenarios = _filter_scenarios(scenarios, config)
+        for scenario in filtered_scenarios:
+            eval_input = EvalCortadoRequest(
+                raw_dict=scenario
+            )
+            all_items["cortado-format"].extend([eval_input])
+
+    return all_items
+
+
+def load_gemini_cli_json(json_file_path, config):
     all_items: dict[str, list[EvalGeminiCliRequest]] = {
         "gemini-cli-format": [],
     }
     with open(json_file_path, "r") as json_file:
         json_item = json_file.read()
+        json_item = _expand_env_placeholders(json_item, json_file_path)
         item = json.loads(json_item)
+
+        # Filter scenarios
+        scenarios = item.get("scenarios", [])
+        filtered_scenarios = _filter_scenarios(scenarios, config)
+        if scenarios and not filtered_scenarios:
+            return all_items
+
+        item["scenarios"] = filtered_scenarios
+
+        # Resolve work_dir for scenarios
+        dataset_dir = os.path.dirname(json_file_path)
+        for scenario in item["scenarios"]:
+            if "work_dir" in scenario:
+                work_dir = scenario["work_dir"]
+                # Resolve relative to dataset file
+                if not os.path.isabs(work_dir):
+                    work_dir = os.path.abspath(os.path.join(dataset_dir, work_dir))
+                scenario["resolved_work_dir"] = work_dir
+
+        # Update payload with modified JSON
+        updated_json_item = json.dumps(item)
+
         eval_input = EvalGeminiCliRequest(
             id=item.get("id", "0"),
-            payload=json_item,
+            payload=updated_json_item,
         )
         all_items["gemini-cli-format"].extend([eval_input])
     return all_items
@@ -118,12 +242,27 @@ def load_json(json_file_path):
 
 
 def load_dataset_from_json(json_file_path, config):
+    # No dataset path (e.g. orchestrators driven by their run config rather than a
+    # prompt dataset): nothing to load. flatten_dataset({}) yields []. Log it so
+    # a run that *did* expect a dataset (missing/misconfigured dataset_config)
+    # doesn't fail silently.
+    if not json_file_path:
+        logging.info(
+            "load_dataset_from_json: no dataset path provided; returning an "
+            "empty dataset. Expected only for orchestrators that drive their "
+            "own inputs from the run config."
+        )
+        return {}
     input_items = {}
     dataset_format = config.get("dataset_format", "evalbench-standard-format")
     if dataset_format == "bird-interact-format":
         all_items = load_bird_interact_dataset(json_file_path, config)
     elif dataset_format in ("gemini-cli-format", "agent-format"):
-        all_items = load_gemini_cli_json(json_file_path)
+        all_items = load_gemini_cli_json(json_file_path, config)
+    elif dataset_format == "cortado-format":
+        all_items = load_cortado_json(json_file_path, config)
+    elif dataset_format == "dea-format":
+        all_items = load_dea_json(json_file_path, config)
     else:
         all_items = load_json(json_file_path)
 
@@ -137,6 +276,14 @@ def load_dataset_from_json(json_file_path, config):
         if "orchestrator" not in config:
             config["orchestrator"] = "interact"
         input_items = all_items
+    elif dataset_format == "cortado-format":
+        if "orchestrator" not in config:
+            config["orchestrator"] = "cortado"
+        input_items = all_items
+    elif dataset_format == "dea-format":
+        if "orchestrator" not in config:
+            config["orchestrator"] = "dea"
+        input_items = all_items
     elif dataset_format in ("gemini-cli-format", "agent-format"):
         if "orchestrator" not in config:
             config["orchestrator"] = "agent" if dataset_format == "agent-format" else "geminicli"
@@ -144,7 +291,7 @@ def load_dataset_from_json(json_file_path, config):
     else:
         raise ValueError("Dataset not in any of the recognised formats")
 
-    if dataset_format not in ["gemini-cli-format", "agent-format", "bird-interact-format"]:
+    if dataset_format not in ["gemini-cli-format", "bird-interact-format", "agent-format", "cortado-format"]:
         totalEntries = sum(len(input_items.get(q, []))
                            for q in ["dql", "dml", "ddl"])
         logging.info(f"Converted {totalEntries} entries to EvalInput.")

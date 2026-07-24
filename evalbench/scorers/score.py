@@ -1,4 +1,4 @@
-"""Performs the compare operation."""
+import inspect
 
 from scorers import comparator
 from scorers import exactmatcher
@@ -9,15 +9,23 @@ from scorers import llmrater
 from scorers import returnedsql
 from scorers import executablesql
 from scorers import trajectorymatcher
+from scorers import skillstrajectorymatcher
 from scorers import goalcompletionrate
 from scorers import behavioralmetrics
 from scorers import parameteranalysis
+from scorers import skillsbestpractices
 from scorers import turncount
+from scorers import agentsteps
 from scorers import endtoendlatency
 from scorers import toolcalllatency
 from scorers import tokenconsumption
+from scorers import tokensprocessed
+from scorers import effectivebilledtokens
 from scorers import binaryrubricscorer
 from scorers import pythonscorer
+from scorers import dataformscorer
+from scorers import dataformcloudscorer
+from scorers import dbtscorer
 from dataset.evaloutput import EvalOutput
 import logging
 import os
@@ -45,8 +53,11 @@ def compare(
     if "set_match" in scorers:
         comparators.append(setmatcher.SetMatcher(scorers["set_match"]))
     if "llmrater" in scorers:
-        comparators.append(llmrater.LLMRater(
-            scorers["llmrater"], global_models))
+        llmrater_config = scorers["llmrater"]
+        llmrater_config["database_configs"] = experiment_config.get(
+            "database_configs", []
+        )
+        comparators.append(llmrater.LLMRater(llmrater_config, global_models))
     if "regexp_matcher" in scorers:
         comparators.append(
             generatedqueryregexpmatcher.GeneratedQueryRegexpMatcher(
@@ -62,6 +73,16 @@ def compare(
     if "trajectory_matcher" in scorers:
         comparators.append(
             trajectorymatcher.TrajectoryMatcher(scorers["trajectory_matcher"])
+        )
+    if "skills_trajectory" in scorers:
+        comparators.append(
+            skillstrajectorymatcher.SkillsTrajectoryMatcher(scorers["skills_trajectory"])
+        )
+    if "skills_best_practices" in scorers:
+        comparators.append(
+            skillsbestpractices.SkillsBestPractices(
+                scorers["skills_best_practices"], global_models
+            )
         )
     if "goal_completion" in scorers:
         comparators.append(
@@ -85,6 +106,10 @@ def compare(
         comparators.append(
             turncount.TurnCount(scorers["turn_count"])
         )
+    if "agent_steps" in scorers:
+        comparators.append(
+            agentsteps.AgentSteps(scorers["agent_steps"])
+        )
     if "end_to_end_latency" in scorers:
         comparators.append(
             endtoendlatency.EndToEndLatency(scorers["end_to_end_latency"])
@@ -96,6 +121,16 @@ def compare(
     if "token_consumption" in scorers:
         comparators.append(
             tokenconsumption.TokenConsumption(scorers["token_consumption"])
+        )
+    if "tokens_processed" in scorers:
+        comparators.append(
+            tokensprocessed.TokensProcessed(scorers["tokens_processed"])
+        )
+    if "effective_billed_tokens" in scorers:
+        comparators.append(
+            effectivebilledtokens.EffectiveBilledTokens(
+                scorers["effective_billed_tokens"]
+            )
         )
     if "binary_rubric_scorer" in scorers:
         import json
@@ -139,13 +174,53 @@ def compare(
                     custom_name = os.path.splitext(os.path.basename(script_path))[0].strip()
                 if not custom_name:
                     custom_name = key
+            scorer_config["database_configs"] = experiment_config.get(
+                "database_configs", []
+            )
             comparators.append(pythonscorer.PythonScorer(scorer_config, name=custom_name))
+    if "dataform_compile" in scorers:
+        comparators.append(
+            dataformscorer.DataformCompileScorer(scorers["dataform_compile"])
+        )
+    if "dataform_run" in scorers:
+        comparators.append(
+            dataformscorer.DataformRunScorer(scorers["dataform_run"])
+        )
+    if "dataform_cloud_compile" in scorers:
+        comparators.append(
+            dataformcloudscorer.DataformCloudCompileScorer(
+                scorers["dataform_cloud_compile"]
+            )
+        )
+    if "dataform_cloud_run" in scorers:
+        comparators.append(
+            dataformcloudscorer.DataformCloudRunScorer(
+                scorers["dataform_cloud_run"]
+            )
+        )
+    if "dbt_compile" in scorers:
+        comparators.append(
+            dbtscorer.DbtCompileScorer(scorers["dbt_compile"])
+        )
+    if "dbt_run" in scorers:
+        comparators.append(
+            dbtscorer.DbtRunScorer(scorers["dbt_run"])
+        )
 
     for comp in comparators:
         score = 0
         comparison_result = comparator.ComparisonResult(comp, 0)
         try:
             if eval_output_item["generated_sql"] is not None:
+                # Dynamically inspect signature to only pass the 'database'
+                # parameter to comparators that explicitly support it,
+                # preventing TypeError crashes in other framework scorers.
+                compare_signature = inspect.signature(comp.compare)
+                compare_kwargs = {}
+                if "database" in compare_signature.parameters:
+                    compare_kwargs["database"] = (
+                        eval_output_item.get("database", "")
+                    )
                 score, logs = comp.compare(
                     eval_output_item["nl_prompt"],
                     eval_output_item["golden_sql"],
@@ -157,6 +232,7 @@ def compare(
                     eval_output_item["generated_result"],
                     eval_output_item.get("eval_results", ""),
                     eval_output_item["generated_error"],
+                    **compare_kwargs,
                 )
                 comparison_result.score = score
                 comparison_result.comparison_logs = logs

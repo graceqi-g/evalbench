@@ -7,6 +7,7 @@ import pickle
 import redis
 import re
 from dataclasses import dataclass, field
+from util.safe_pickle import safe_pickle_loads
 
 # CLIENT is initialized lazily to avoid blocking network calls during module import,
 # which can cause hangs in restricted environments like Cloud Build.
@@ -52,21 +53,22 @@ def _is_db_secret_path(secret: str) -> bool:
     return bool(re.match(pattern, secret))
 
 
+def access_secret(secret_path: str) -> str:
+    """Returns the decoded UTF-8 payload of a Secret Manager version.
+
+    Caller is responsible for validating the resource path shape.
+    """
+    request = secretmanager_v1.AccessSecretVersionRequest(name=secret_path)
+    response = get_client().access_secret_version(request=request)
+    return response.payload.data.decode("utf-8")
+
+
 def get_db_secret(secret):
     if not _is_db_secret_path(secret):
         raise ValueError(
             "secret manager path not parsable. Could not recover password for DB."
         )
-    secret_path = secret
-    # Initialize request argument(s)
-    request = secretmanager_v1.AccessSecretVersionRequest(
-        name=secret_path,
-    )
-    # Make the request
-    response = get_client().access_secret_version(request=request)
-
-    # Return the secret
-    return response.payload.data.decode("utf-8")
+    return access_secret(secret)
 
 
 def generate_ddl(data, db_name, comments_data=None):
@@ -124,7 +126,7 @@ def with_cache_execute(
         cached_result = cache_client.get(query_hash)
         if cached_result:
             logging.debug(f"Using cached result for query: {query}")
-            return pickle.loads(cached_result), None, None
+            return safe_pickle_loads(cached_result), None, None
     except Exception as e:
         logging.warning(f"Failed to retrieve query from cache: {e}")
 

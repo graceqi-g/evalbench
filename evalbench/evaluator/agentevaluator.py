@@ -2,11 +2,13 @@ from typing import Any, List
 import datetime
 import concurrent.futures
 import logging
+import os
+import shutil
+import threading
 
 from dataset.evalgeminicliinput import EvalGeminiCliRequest
-from generators.models.gemini_cli import GeminiCliGenerator
-from generators.models.claude_code import ClaudeCodeGenerator
-from util.config import load_yaml_config
+from generators.models import get_generator
+from generators.models.agent_cli import AgentCliGenerator
 from mp import mprunner
 from work.agentgenwork import AgentGenWork
 from evaluator.simulateduser import SimulatedUser
@@ -23,26 +25,23 @@ class AgentEvaluator:
     ):
         self.config = config
 
-        # Load model config if provided
-        model_config = config
-        if "model_config" in config and isinstance(config["model_config"], str):
-            loaded_config = load_yaml_config(config["model_config"])
-            # Merge main config into loaded config, giving precedence to main config
-            model_config = loaded_config.copy()
-            model_config.update(config)
-
-        generator_type = model_config.get("generator")
-        if generator_type == "gemini_cli":
-            self.agent_version = model_config.get(
-                "gemini_cli_version", config.get("gemini_cli_version"))
-            self.generator = GeminiCliGenerator(model_config)
-        elif generator_type == "claude_code":
-            self.agent_version = model_config.get(
-                "claude_code_version", config.get("claude_code_version", "claude"))
-            self.generator = ClaudeCodeGenerator(model_config)
-        else:
+        model_config_path = config.get("model_config")
+        if not isinstance(model_config_path, str):
             raise ValueError(
-                f"Unsupported generator type for AgentEvaluator: {generator_type}")
+                "AgentEvaluator requires `model_config` to be a path to a model YAML")
+
+        global_models = {
+            "lock": threading.Lock(),
+            "registered_models": {},
+        }
+        self.generator = get_generator(global_models, model_config_path)
+
+        if not isinstance(self.generator, AgentCliGenerator):
+            raise ValueError(
+                f"AgentEvaluator only supports agent CLI generators "
+                f"(gemini_cli, claude_code, codex_cli, agy_cli), got "
+                f"{type(self.generator).__name__}")
+        self.agent_version = self.generator.version
 
         runner_config = self.config.get("runners", {})
         self.agent_runners = runner_config.get("agent_runners", 10)
@@ -54,11 +53,11 @@ class AgentEvaluator:
         job_id: str,
         run_time: datetime.datetime,
     ):
-        if isinstance(self.generator, (GeminiCliGenerator, ClaudeCodeGenerator)):
+        if isinstance(self.generator, AgentCliGenerator):
             return self._evaluate_agent_cli(dataset, job_id, run_time)
         else:
             raise NotImplementedError(
-                "This evaluator currently only supports GeminiCliGenerator and ClaudeCodeGenerator")
+                "This evaluator currently only supports GeminiCliGenerator, ClaudeCodeGenerator, CodexCliGenerator and AgyCliGenerator")
 
     def _evaluate_agent_cli(
         self,
@@ -116,31 +115,48 @@ class AgentEvaluator:
         conversation_plan = scenario.get("conversation_plan", "")
         conversation_history = []
         accumulated_tools = []
+        accumulated_skills = []
         last_result = None
+
+        resolved_work_dir = scenario.get("resolved_work_dir")
+        if resolved_work_dir:
+            os.makedirs(resolved_work_dir, exist_ok=True)
+
+        # Copy declared env_files to fake_home
+        fake_home = getattr(self.generator, "fake_home", None)
+        if fake_home:
+            session_dir = os.path.dirname(fake_home)
+            env_files = scenario.get("env_files", [])
+            for env_file in env_files:
+                src_path = os.path.join(session_dir, "env_files", env_file)
+                dest_path = os.path.join(fake_home, env_file)
+                if os.path.exists(src_path):
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    shutil.copy2(src_path, dest_path)
+                    logging.info(
+                        "Natively copied env file to sandbox: %s", dest_path
+                    )
+                else:
+                    logging.warning(
+                        "Declared env file not found in session: %s", src_path
+                    )
 
         session_id = None
         for turn in range(max_turns):
             logging.info(
                 f"Turn {turn + 1}/{max_turns} - Prompt: {current_prompt}")
-            if isinstance(self.generator, (GeminiCliGenerator, ClaudeCodeGenerator)):
-                if isinstance(self.generator, ClaudeCodeGenerator):
-                    cli_cmd = self.generator.create_command(
-                        cli=self.agent_version,
-                        prompt=current_prompt,
-                        env=env,
-                        resume=(turn > 0),
-                        session_id=session_id
-                    )
-                else:
-                    cli_cmd = self.generator.create_command(
-                        cli=self.agent_version,
-                        prompt=current_prompt,
-                        env=env,
-                        resume=(turn > 0)
-                    )
+            if isinstance(self.generator, AgentCliGenerator):
+                cli_cmd = self.generator.create_command(
+                    cli=self.agent_version,
+                    prompt=current_prompt,
+                    env=env,
+                    resume=(turn > 0),
+                    session_id=session_id,
+                    cwd=resolved_work_dir,
+                )
                 try:
                     result = self.generator.safe_generate(cli_cmd)
-                    if isinstance(self.generator, ClaudeCodeGenerator) and result.stdout:
+                    if result.stdout:
                         parsed = self.generator.parse_response(result.stdout)
                         if parsed.get("session_id"):
                             session_id = parsed["session_id"]
@@ -161,9 +177,14 @@ class AgentEvaluator:
             self._log_cli_result(turn, max_turns, result)
 
             tools = []
-            if isinstance(self.generator, (GeminiCliGenerator, ClaudeCodeGenerator)):
+            if isinstance(self.generator, AgentCliGenerator):
                 tools = self.generator.extract_tools(result.stdout)
             accumulated_tools.extend(tools)
+
+            # Extract skills from generator output
+            if isinstance(self.generator, AgentCliGenerator):
+                skills = self.generator.extract_skills(result.stdout)
+                accumulated_skills.extend(skills)
 
             conversation_history.append({
                 "user": current_prompt,
@@ -190,6 +211,7 @@ class AgentEvaluator:
                 last_result,
                 conversation_history,
                 accumulated_tools,
+                accumulated_skills,
                 eval_result,
                 job_id,
                 metadata
@@ -210,6 +232,7 @@ class AgentEvaluator:
         last_result: subprocess.CompletedProcess,
         conversation_history: List[Dict[str, str]],
         accumulated_tools: List[str],
+        accumulated_skills: List[str],
         eval_result: Any,
         job_id: str,
         metadata: Dict[str, Any]
@@ -230,8 +253,10 @@ class AgentEvaluator:
             "conversation_history": json.dumps(conversation_history, indent=2),
             "scenario": scenario,
             "accumulated_tools": accumulated_tools,
+            "accumulated_skills": accumulated_skills,
             "job_id": job_id,
-            "metadata": metadata
+            "metadata": metadata,
+            "fake_home": self.generator.fake_home if hasattr(self.generator, "fake_home") else None
         }
 
         score_work = AgentScoreWork(

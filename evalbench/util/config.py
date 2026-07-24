@@ -41,7 +41,7 @@ def load_db_data_from_csvs(data_directory: str):
             with open(
                 os.path.join(current_directory, data_directory, filename), "r"
             ) as csvfile:
-                reader = csv.reader(csvfile)
+                reader = csv.reader(csvfile, quotechar='"')
                 rows = []
                 for row in reader:
                     rows.append(row)
@@ -189,6 +189,11 @@ def get_google3_relative_path(value, session_id):
 
 def set_session_configs(session, experiment_config: dict):
     session["config"] = experiment_config
+    # Always set dataset_config so callers can subscript it unconditionally. Some
+    # orchestrators (e.g. mcp_readability) drive their work from the run config
+    # itself and have no prompt dataset, in which case this stays None and
+    # load_dataset_from_json returns {}.
+    session["dataset_config"] = None
     if "dataset_config" in experiment_config and experiment_config["dataset_config"]:
         # Handle both flat string paths and nested dicts (e.g. BIRD configs)
         dc = experiment_config["dataset_config"]
